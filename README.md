@@ -238,9 +238,8 @@ Keep your config simple and these limitations will not affect you.
 
 ## Roadmap
 
-- [ ] `--check-update` -- skip sync if Hagezi list hasn't changed since last run
-- [ ] Exponential backoff with `Retry-After` header support
-- [ ] Optional atomic two-phase sync (blocked by ControlD API group rename support)
+- [ ] `--check-update` — skip sync if Hagezi lists haven't changed (high priority)
+- [ ] Optional atomic two-phase sync (blocked by ControlD API improvements)
 
 ---
 
@@ -256,6 +255,18 @@ Keep your config simple and these limitations will not affect you.
 
 ---
 
+## Development Note
+
+This project was built in a single day using heavy AI assistance (primarily Kimi + Gemini) **on a mobile device** (Termux on Android), with full human oversight, testing, and refinement by the maintainer.
+
+I have a strong Bash background (including previous projects like [PixelProps](https://github.com/Pixel-Props)) and understand every line of the script — the AI simply accelerated development dramatically.
+
+---
+
+**⭐ If this tool saves you time, please star the repo!** It really helps with visibility.
+
+---
+
 ## License
 
-MIT -- see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE)
