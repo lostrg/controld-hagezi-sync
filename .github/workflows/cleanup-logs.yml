@@ -1,0 +1,27 @@
+# cleanup-logs.yml
+name: Cleanup sync logs
+
+on:
+  workflow_run:
+    workflows: ["Sync Hagezi to ControlD"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  delete-logs:
+    runs-on: ubuntu-latest
+    # only clean up successful *scheduled* runs, matching your original intent
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'schedule'
+    steps:
+      - name: Delete logs for the completed run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/logs
