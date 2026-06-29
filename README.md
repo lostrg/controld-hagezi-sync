@@ -9,7 +9,7 @@
 
 > **Zero-dependency Bash with TOML power.** No Python virtualenvs, no Go binaries, no opaque profile IDs. Write human-readable profile names, mix-and-match folders per profile, dry-run before you push, and know exactly how fresh your blocklists are.
 
-Automatically sync Hagezi DNS blocklists to your ControlD profiles via the ControlD API.
+Automatically sync HaGeZi DNS blocklists to your ControlD profiles via the ControlD API.
 
 ---
 
@@ -40,14 +40,14 @@ Automatically sync Hagezi DNS blocklists to your ControlD profiles via the Contr
 
 ## What it does
 
-- Downloads the latest Hagezi blocklist folder definitions (JSON)
+- Downloads the latest HaGeZi blocklist folder definitions (JSON)
 - Backs up existing folders before deletion (automatic fallback on failure)
 - Deletes existing folders in your ControlD profiles (by PK)
 - Recreates them with fresh rules, batched in groups of 500
 - Supports multiple profiles with **different folder combinations**
 - Runs on a schedule or on-demand via GitHub Actions
 - **Dry-run mode** to preview changes before they go live
-- **Freshness report** showing when each Hagezi list was last updated on GitHub
+- **Freshness report** showing when each HaGeZi list was last updated on GitHub
 
 ---
 
@@ -67,7 +67,7 @@ cp config.toml.example config.toml
    - Name: `CONTROLD_API_TOKEN`
    - Value: your ControlD API Write Token from controld.com/dashboard/api
 6. **Run it:**
-   - Go to **Actions -> Sync Hagezi to ControlD -> Run workflow**
+   - Go to **Actions -> Sync HaGeZi to ControlD -> Run workflow**
    - Or wait for the daily 03:00 UTC cron job
 
 After each run, check the **Summary** tab on the workflow run page for a clean markdown table showing exactly what succeeded, what failed, and the rule counts for each profile/folder combination.
@@ -102,7 +102,7 @@ chmod +x sync-hagezi.sh
 
 ## Discover available folders
 
-Instead of hunting through the Hagezi repo, let the script list everything for you:
+Instead of hunting through the HaGeZi repo, let the script list everything for you:
 
 ```bash
 ./sync-hagezi.sh --list-hagezi
@@ -122,7 +122,7 @@ All behavior is driven by `config.toml`.
 | `[settings]` | `dry_run` | Set to `true` to preview without changes. |
 | `[settings]` | `show_freshness` | Set to `false` to skip the upstream freshness report after sync. Useful in CI to avoid GitHub's unauthenticated rate limit (60 req/hr). |
 | `[profiles]` | `names` | Array of exact ControlD profile names to sync. |
-| `[folders]` | `"Name"` | Maps a friendly folder name to its Hagezi JSON URL. |
+| `[folders]` | `"Name"` | Maps a friendly folder name to its HaGeZi JSON URL. |
 | `[profile_folders]` | `` | Array of folder names to sync to that profile. |
 
 ### Example: Adding a new profile
@@ -160,11 +160,10 @@ Tesla = ["Badware Hoster", "My Custom List"]
 
 ```text
 ./sync-hagezi.sh [OPTIONS]
-
  --config FILE      Use a custom configuration file (default: config.toml)
  --dry-run          Preview changes without modifying ControlD
  --profile NAME     Sync only one profile
- --list-hagezi      List available Hagezi folders (ready for config.toml)
+ --list-hagezi      List available HaGeZi folders (ready for config.toml)
  --last-updated     Show the last updated date for configured folders and exit
  --no-freshness     Skip the upstream freshness report at end of sync
  -h, --help         Show help
@@ -182,7 +181,7 @@ Tesla = ["Badware Hoster", "My Custom List"]
 # Use a different config file
 CONFIG_FILE=prod.toml ./sync-hagezi.sh
 
-# List available Hagezi sources
+# List available HaGeZi sources
 ./sync-hagezi.sh --list-hagezi
 
 # Check upstream freshness without syncing
@@ -206,7 +205,7 @@ When running manually via **Actions -> Run workflow**, you can specify:
 After the run completes, open the **Summary** tab on the workflow run page to see:
 
 1. **Sync Results** — a markdown table with profile, folder, status (✅/❌), and rule count
-2. **Upstream Freshness** — when each Hagezi list was last updated on GitHub (relative time + UTC)
+2. **Upstream Freshness** — when each HaGeZi list was last updated on GitHub (relative time + UTC)
 
 ---
 
@@ -231,14 +230,14 @@ After the run completes, open the **Summary** tab on the workflow run page to se
 
 1. Reads `config.toml` to know which profiles and folders to manage.
 2. Fetches your ControlD profile list to resolve names to IDs.
-3. Downloads each Hagezi folder JSON once (cached per run).
+3. Downloads each HaGeZi folder JSON once (cached per run).
 4. For each profile, **backs up existing folders** before deletion.
 5. Deletes existing folders by PK, then recreates them with fresh rules.
 6. Rules are inserted in batches of 500 using **jq-native JSON construction** for robust, injection-safe payloads.
 7. If rule injection fails, **automatically restores the original folder from backup**.
 8. Freshness timestamps are parsed with **pure jq** (`fromdateiso8601`) — identical behavior on Linux, macOS, and Termux without platform-specific `date` binaries.
 9. In GitHub Actions, generates a **markdown summary** on the workflow run page with sync results and upstream freshness.
-10. Prints a freshness report showing when each Hagezi list was last updated on GitHub (local CLI only; Actions gets it in the Summary tab).
+10. Prints a freshness report showing when each HaGeZi list was last updated on GitHub (local CLI only; Actions gets it in the Summary tab).
 
 ---
 
@@ -264,14 +263,14 @@ Keep your config simple and these limitations will not affect you.
 ## Known Limitations
 
 - **Destructive sync:** Folders are deleted and recreated. An interrupted sync may leave a profile without that folder's rules until the next run.
-- **No rule-level diff:** We don't compare individual rules against the existing folder. If Hagezi's JSON hasn't changed, we still delete and recreate.
+- **No rule-level diff:** We don't compare individual rules against the existing folder. If HaGeZi's JSON hasn't changed, we still delete and recreate.
 - **Bash TOML parser:** See [TOML Parser Limitations](#toml-parser-limitations) above.
 
 ---
 
 ## Roadmap
 
-- [ ] `--check-update` — skip sync if Hagezi lists haven't changed (high priority)
+- [ ] `--check-update` — skip sync if HaGeZi lists haven't changed (high priority)
 - [ ] Optional atomic two-phase sync (blocked by ControlD API improvements)
 
 ---
