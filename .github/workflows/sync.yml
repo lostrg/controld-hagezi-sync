@@ -25,9 +25,14 @@ on:
         required: false
         default: false
 
+concurrency:
+  group: controld-sync
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       has_updates: ${{ steps.set-output.outputs.updates }}
     steps:
@@ -42,13 +47,16 @@ jobs:
 
       - name: Check for upstream changes
         id: check
-        if: ${{ inputs.skip_check != 'true' }}
+        if: ${{ inputs.skip_check != true }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           output=$(./sync-hagezi.sh --check-updates 2>&1)
+          exit_code=$?
+          set -e
           echo "$output"
-          if echo "$output" | grep -q "HAGEZI_UPDATES_AVAILABLE=true"; then
+          if [[ $exit_code -eq 0 ]]; then
             echo "updates=true" >> "$GITHUB_OUTPUT"
           else
             echo "updates=false" >> "$GITHUB_OUTPUT"
@@ -73,6 +81,7 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.has_updates == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -89,9 +98,12 @@ jobs:
         env:
           CONTROLD_API_TOKEN: ${{ secrets.CONTROLD_API_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROFILE: ${{ inputs.profile }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          NO_CACHE: ${{ inputs.no_cache }}
         run: |
-          args="--no-freshness"
-          [ "${{ inputs.dry_run }}" = "true" ] && args="$args --dry-run"
-          [ -n "${{ inputs.profile }}" ] && args="$args --profile ${{ inputs.profile }}"
-          [ "${{ inputs.no_cache }}" = "true" ] && args="$args --no-cache"
-          bash sync-hagezi.sh $args
+          args=(--no-freshness)
+          [[ "$DRY_RUN" == "true" ]] && args+=(--dry-run)
+          [[ -n "$PROFILE" ]] && args+=(--profile "$PROFILE")
+          [[ "$NO_CACHE" == "true" ]] && args+=(--no-cache)
+          bash sync-hagezi.sh "${args[@]}"

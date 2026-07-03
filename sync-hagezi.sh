@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.1.2
+# Version: 2.2.0
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
-# Requirements: bash 4.3+, curl, jq
+# Requirements: bash 4.3+, curl, jq, cmp
 # =============================================================================
 
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.1.2"
+VERSION="2.2.0"
+
+# Bash version check
+if (( BASH_VERSINFO[0] < 4 )); then
+    printf "[ERROR] bash 4.0+ required (found %d.%d)\n" "$BASH_VERSINFO[0]" "$BASH_VERSINFO[1]" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -23,8 +29,8 @@ API_RETRIES=3
 API_BACKOFF_BASE=2
 
 # Persistent cache for content-based change detection
-SYNC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/controld-hagezi-sync"
-CACHE_VERSION="3"
+SYNC_CACHE="${SYNC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/controld-hagezi-sync}"
+CACHE_VERSION="4"
 
 # ---------------------------------------------------------------------------
 # GLOBALS
@@ -32,7 +38,7 @@ CACHE_VERSION="3"
 
 declare -a PROFILE_NAMES
 declare -A HAGEZI_FOLDERS PROFILE_FOLDERS _TOML_VALS
-declare -A FOLDER_CHANGED
+declare -A FOLDER_CHANGED FOLDER_FAILED
 
 DRY_RUN=false
 ACTION_LAST_UPDATED=false
@@ -44,6 +50,7 @@ SUCCESS_COUNT=0
 FAILED_COUNT=0
 WORK_DIR=""
 SUMMARY_FILE=""
+AUTH_HDR_FILE=""
 
 API_BODY_FILE=""
 API_HDR_FILE=""
@@ -55,6 +62,17 @@ API_HDR_FILE=""
 log() { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2; }
 
 # ---------------------------------------------------------------------------
+# SAFE NAME HELPER
+# ---------------------------------------------------------------------------
+
+safe_name() {
+    local s="$1"
+    s="${s//[^A-Za-z0-9._-]/_}"
+    s="${s//__/_}"
+    echo "$s"
+}
+
+# ---------------------------------------------------------------------------
 # API RETRY HELPER
 # ---------------------------------------------------------------------------
 
@@ -62,21 +80,19 @@ api_call_with_retry() {
     local method="$1" url="$2" data="${3:-}"
     local retries=$API_RETRIES delay=$API_BACKOFF_BASE
     local code body retry_after
-    local curl_opts=("--request" "$method" "--url" "$url" "--header" "Authorization: Bearer ${API_TOKEN}")
+    local curl_opts=("--request" "$method" "--url" "$url" "--header" @"$AUTH_HDR_FILE" "--connect-timeout" "10" "--max-time" "300")
 
     if [[ -n "$data" ]]; then
         if [[ "$data" == @* ]]; then
-            # File pointer payload (bypasses ARG_MAX)
             curl_opts+=("--header" "content-type: application/json" "--data-binary" "$data")
         else
-            # Standard string payload
             curl_opts+=("--header" "content-type: application/json" "--data" "$data")
         fi
     fi
 
     if [[ -z "$API_BODY_FILE" ]]; then
-        API_BODY_FILE="$WORK_DIR/api_body_$$"
-        API_HDR_FILE="$WORK_DIR/api_hdr_$$"
+        API_BODY_FILE="$WORK_DIR/api_body_$BASHPID"
+        API_HDR_FILE="$WORK_DIR/api_hdr_$BASHPID"
         touch "$API_BODY_FILE" "$API_HDR_FILE"
     fi
 
@@ -86,7 +102,10 @@ api_call_with_retry() {
         code=$(curl -s -o "$API_BODY_FILE" -D "$API_HDR_FILE" -w "%{http_code}" "${curl_opts[@]}")
         body=$(cat "$API_BODY_FILE")
 
-        [[ "$code" =~ ^(200|201|204)$ ]] && { echo "$body"; return 0; }
+        [[ "$code" =~ ^(200|201|204)$ ]] && { printf '%s\n' "$body"; return 0; }
+
+        retries=$(( retries - 1 ))
+        [[ "$retries" -le 0 ]] && { log "  ERROR: Max retries exceeded for $method $url"; return 1; }
 
         if [[ "$code" == "429" ]]; then
             retry_after=$(awk '/^[Rr]etry-[Aa]fter:/ {print $2}' "$API_HDR_FILE" | tr -d '\r\n')
@@ -106,9 +125,6 @@ api_call_with_retry() {
             log "  ERROR: API call failed (HTTP $code) on $method $url"
             return 1
         fi
-
-        retries=$(( retries - 1 ))
-        [[ "$retries" -le 0 ]] && { log "  ERROR: Max retries exceeded for $method $url"; return 1; }
     done
 }
 
@@ -149,7 +165,8 @@ parse_toml() {
             open_chars="${array_buf//[^\[]/}"; close_chars="${array_buf//[^\]]/}"
             [[ "${#close_chars}" -ge "${#open_chars}" ]] && {
                 in_array=0
-                inner="${array_buf#*\[}"; inner="${array_buf%\]*}"
+                inner="${array_buf#*\[}"
+                inner="${inner%\]*}"
                 _TOML_VALS["${section}|${key}"]=$(parse_toml_array "$inner")
                 array_buf=""
             }
@@ -173,7 +190,8 @@ parse_toml() {
             array_buf="$raw_val"
             open_chars="${array_buf//[^\[]/}"; close_chars="${array_buf//[^\]]/}"
             if [[ "${#close_chars}" -ge "${#open_chars}" ]]; then
-                inner="${array_buf#*\[}"; inner="${array_buf%\]*}"
+                inner="${array_buf#*\[}"
+                inner="${inner%\]*}"
                 _TOML_VALS["${section}|${key}"]=$(parse_toml_array "$inner")
                 array_buf=""
             else
@@ -211,7 +229,7 @@ parse_toml_array() {
     echo "${items[*]}"
 }
 
-toml_get() { echo "${_TOML_VALS["$1|$2"]:-}"; }
+toml_get() { printf '%s\n' "${_TOML_VALS["$1|$2"]:-}"; }
 
 toml_get_array() {
     local raw="${_TOML_VALS["$1|$2"]:-}"
@@ -248,7 +266,7 @@ load_config() {
 }
 
 validate_config() {
-    local key url has_errors=0 pname p found
+    local key url has_errors=0 pname p found f
     for key in "${!_TOML_VALS[@]}"; do
         [[ "$key" == folders\|* ]] || continue
         url="${_TOML_VALS[$key]}"
@@ -267,6 +285,17 @@ validate_config() {
         [[ "$found" -eq 0 ]] && log "WARN: [profile_folders] has mapping for '$pname' but it's not in [profiles] names"
     done
 
+    # Cross-check folder references
+    for pname in "${PROFILE_NAMES[@]}"; do
+        local mapping="${PROFILE_FOLDERS[$pname]}"
+        [[ -z "$mapping" ]] && continue
+        local IFS=$'\x1F'
+        read -ra mapped_folders <<< "$mapping"
+        for f in "${mapped_folders[@]}"; do
+            [[ -z "${HAGEZI_FOLDERS[$f]}" ]] && { log "ERROR: Profile '$pname' references undefined folder '$f'"; has_errors=1; }
+        done
+    done
+
     [[ "$has_errors" -ne 0 ]] && { log "FATAL: Configuration validation failed"; exit 1; }
 }
 
@@ -274,6 +303,7 @@ check_deps() {
     local missing=()
     command -v curl &>/dev/null || missing+=("curl")
     command -v jq   &>/dev/null || missing+=("jq")
+    command -v cmp  &>/dev/null || missing+=("cmp")
     [[ ${#missing[@]} -gt 0 ]] && { log "ERROR: Missing dependencies: ${missing[*]}"; exit 1; }
 
     if ! jq -e 'fromdateiso8601' >/dev/null 2>&1 <<< '"1970-01-01T00:00:00Z"'; then
@@ -289,12 +319,19 @@ get_all_profiles() {
     local body
     body=$(api_call_with_retry "GET" "${API_BASE}/profiles") || return 1
     jq -e '.body.profiles' >/dev/null 2>&1 <<< "$body" || { log "ERROR: No profiles found" >&2; return 1; }
-    echo "$body"
+    printf '%s\n' "$body"
 }
 
 find_profile_id() { jq -r --arg n "$2" '.body.profiles[] | select(.name == $n) | .PK' 2>/dev/null <<< "$1" | head -n1; }
 get_profile_groups() { api_call_with_retry "GET" "${API_BASE}/profiles/$1/groups"; }
-find_group_pk_by_name() { jq -r --arg g "$2" '.body.groups[] | select(.group == $g) | .PK' 2>/dev/null <<< "$1" | head -n1; }
+find_group_pk_by_name() { 
+    local pks
+    pks=$(jq -r --arg g "$2" '[.body.groups[] | select(.group == $g) | .PK] | .[]' 2>/dev/null <<< "$1")
+    local count
+    count=$(grep -c '^' <<< "$pks" || true)
+    [[ "$count" -gt 1 ]] && log "  WARN: Multiple groups named '$2' found ($count copies), using first"
+    head -n1 <<< "$pks"
+}
 
 delete_group_by_pk() {
     [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would delete folder (PK: $2)"; return 0; }
@@ -346,7 +383,7 @@ hagezi_folder_epoch() {
     filepath="${url#*main/}"
     api_url="https://api.github.com/repos/hagezi/dns-blocklists/commits?path=${filepath}&per_page=1"
 
-    resp=$(curl -s -w "\n%{http_code}" "${gh_headers[@]}" "$api_url")
+    resp=$(curl -s --connect-timeout 10 --max-time 60 -w "\n%{http_code}" "${gh_headers[@]}" "$api_url")
     code=$(tail -n1 <<< "$resp")
     body=$(sed '$d' <<< "$resp")
 
@@ -358,11 +395,12 @@ hagezi_folder_epoch() {
     epoch=$(jq -r --arg date "$date_str" '($date | sub("\\.[0-9]+"; "") | fromdateiso8601)' 2>/dev/null <<< '{}')
     if [[ -z "$epoch" || "$epoch" == "null" ]]; then
         local date_clean="${date_str%%.*}"
-        epoch=$(date -d "$date_clean" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "$date_clean" +%s 2>/dev/null)
+        date_clean="${date_clean%Z}"
+        epoch=$(date -u -d "${date_clean}UTC" +%s 2>/dev/null || date -j -u -f "%Y-%m-%dT%H:%M:%S" "$date_clean" +%s 2>/dev/null)
     fi
     [[ -z "$epoch" || "$epoch" == "null" ]] && return 1
 
-    echo "${epoch}|${date_str}"
+    printf '%s\n' "${epoch}|${date_str}"
 }
 
 # ---------------------------------------------------------------------------
@@ -371,11 +409,11 @@ hagezi_folder_epoch() {
 
 download_folder_smart() {
     local url="$1" cachefile="$2" fname="$3"
-    local persistent="$SYNC_CACHE/${fname// /_}.json"
-    local tmpfile="$WORK_DIR/${fname// /_}_dl.json"
+    local persistent="$SYNC_CACHE/$(safe_name "$fname").json"
+    local tmpfile="$WORK_DIR/$(safe_name "$fname")_dl.json"
     local code
 
-    code=$(curl -sL -o "$tmpfile" -w "%{http_code}" "$url")
+    code=$(curl -sL --connect-timeout 10 --max-time 60 -o "$tmpfile" -w "%{http_code}" "$url")
 
     if [[ "$code" != "200" ]]; then
         log "  ERROR: $fname: HTTP $code"
@@ -385,6 +423,13 @@ download_folder_smart() {
 
     if ! jq empty "$tmpfile" 2>/dev/null; then
         log "  ERROR: $fname: Invalid JSON received"
+        rm -f "$tmpfile"
+        return 1
+    fi
+
+    # Schema validation
+    if ! jq -e '(.group.group | type == "string") and (.rules | type == "array")' "$tmpfile" >/dev/null 2>&1; then
+        log "  ERROR: $fname: JSON schema invalid (missing group.group or rules array)"
         rm -f "$tmpfile"
         return 1
     fi
@@ -402,9 +447,6 @@ download_folder_smart() {
         return 2
     fi
 
-    if [[ "$CHECK_UPDATES" == false ]]; then
-        cp "$tmpfile" "$persistent"
-    fi
     mv "$tmpfile" "$cachefile"
     return 0
 }
@@ -414,7 +456,7 @@ list_hagezi() {
     local api_url="https://api.github.com/repos/hagezi/dns-blocklists/contents/controld"
     local resp code body count
 
-    resp=$(curl -s -w "\n%{http_code}" -H "Accept: application/vnd.github.v3+json" -H "User-Agent: controld-hagezi-sync/${VERSION}" "$api_url")
+    resp=$(curl -s --connect-timeout 10 --max-time 60 -w "\n%{http_code}" -H "Accept: application/vnd.github.v3+json" -H "User-Agent: controld-hagezi-sync/${VERSION}" "$api_url")
     code=$(tail -n1 <<< "$resp")
     body=$(sed '$d' <<< "$resp")
 
@@ -517,7 +559,7 @@ parse_args() {
             --check-updates) CHECK_UPDATES=true; shift ;;
             --no-cache) NO_CACHE=true; shift ;;
             -h|--help|-help) show_help; exit 0 ;;
-            *) log "WARN: Unknown argument: $1"; shift ;;
+            *) log "FATAL: Unknown argument: $1"; exit 1 ;;
         esac
     done
 }
@@ -608,7 +650,9 @@ rollback_group() {
 
     if [[ -n "$new_pk" && "$new_pk" != "null" ]]; then
         log "  Deleting partially-imported group..."
-        delete_group_by_pk "$pid" "$new_pk" 2>/dev/null || true
+        if ! delete_group_by_pk "$pid" "$new_pk" 2>/dev/null; then
+            log "  WARN: Failed to delete partially-imported group $new_pk"
+        fi
     fi
 
     if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
@@ -634,13 +678,16 @@ import_with_validation() {
     local import_payload_file new_pk refreshed_groups
     local total_rules persistent
     local attempt=0 max_attempts=2
+    local -i last_count=-1 stable_count=0
 
-    import_payload_file="$WORK_DIR/import_${pid}_$$.json"
+    import_payload_file="$WORK_DIR/import_${pid}_$BASHPID.json"
     total_rules=$(jq '.rules | length' "$cachefile")
+
     jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile" > "$import_payload_file"
 
     while (( attempt < max_attempts )); do
         attempt=$(( attempt + 1 ))
+        new_pk=""
         [[ "$attempt" -gt 1 ]] && log "  Retry attempt $attempt/$max_attempts..."
 
         log "  Importing $total_rules rules as '$name'..."
@@ -651,10 +698,12 @@ import_with_validation() {
 
         # Poll for group appearance with expected rule count
         log "  Polling for import completion..."
-        local -i poll_count=0 max_polls=30
+        local -i poll_count=0 max_polls=$(( 30 + total_rules / 2000 ))
+        local sleep_time=1
         while (( poll_count < max_polls )); do
-            sleep 1
+            sleep "$sleep_time"
             poll_count=$(( poll_count + 1 ))
+            sleep_time=$(( sleep_time < 8 ? sleep_time + 1 : sleep_time ))
 
             refreshed_groups=$(get_profile_groups "$pid") || { sleep 1; continue; }
             new_pk=$(find_group_pk_by_name "$refreshed_groups" "$name")
@@ -668,12 +717,21 @@ import_with_validation() {
                         log "  New group imported with PK: $new_pk"
                         log "  Validation passed: $actual_count/$total_rules rules match (${poll_count}s)"
                         rm -f "$import_payload_file"
-                        echo "$new_pk"
+                        printf '%s\n' "$new_pk"
                         return 0
+                    elif [[ "$actual_count" == "$last_count" ]]; then
+                        stable_count=$((stable_count + 1))
+                        if [[ "$stable_count" -ge 3 ]]; then
+                            log "  WARN: Validation accepted with stable count $actual_count/$total_rules (server may have deduped) (${poll_count}s)"
+                            rm -f "$import_payload_file"
+                            printf '%s\n' "$new_pk"
+                            return 0
+                        fi
                     else
-                        log "  Waiting for rules to populate: $actual_count / $total_rules..."
-                        # Continue polling — do NOT break
+                        stable_count=0
                     fi
+                    last_count="$actual_count"
+                    log "  Waiting for rules to populate: $actual_count / $total_rules..."
                 fi
             fi
         done
@@ -684,7 +742,7 @@ import_with_validation() {
             delete_group_by_pk "$pid" "$new_pk" 2>/dev/null || true
         fi
 
-        persistent="$SYNC_CACHE/${fname// /_}.json"
+        persistent="$SYNC_CACHE/$(safe_name "$fname").json"
         rm -f "$persistent"
 
         local dl_status
@@ -697,6 +755,10 @@ import_with_validation() {
         fi
 
         total_rules=$(jq '.rules | length' "$cachefile")
+        if [[ "$total_rules" -eq 0 ]]; then
+            log "  WARN: Re-downloaded '$name' has 0 rules, aborting"
+            break
+        fi
         jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile" > "$import_payload_file"
     done
 
@@ -714,15 +776,32 @@ sync_folder() {
 
     log "  Folder: $fname"
 
-    [[ ! -f "$cachefile" ]] && {
+    if [[ ! -f "$cachefile" ]]; then
         log "  ERROR: Cached file missing"
         summary_row "$pname" "$fname" "❌ Cache missing" "-"
         return 1
-    }
+    fi
 
-    name=$(jq -r '.group.group' "$cachefile")
+    # Canonical name is the config key (H1 fix)
+    name="$fname"
     total_rules=$(jq '.rules | length' "$cachefile")
     old_name="${name}_OLD"
+
+    # Handle empty lists gracefully
+    if [[ "$total_rules" -eq 0 ]]; then
+        log "  WARN: '$fname' has 0 rules"
+        existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
+        if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
+            if [[ "$DRY_RUN" == true ]]; then
+                log "  [DRY-RUN] Would delete empty group '$name' (PK: $existing_pk)"
+            else
+                log "  Deleting empty group '$name' (PK: $existing_pk)..."
+                delete_group_by_pk "$pid" "$existing_pk"
+            fi
+        fi
+        summary_row "$pname" "$fname" "⚠️ Empty list" "0"
+        return 0
+    fi
 
     existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
 
@@ -783,7 +862,7 @@ sync_folder() {
 main() {
     local fname cachefile dl_status
     local skipped=0 downloaded=0 failed=0
-    local pname pid PROFILE_GROUPS folder_list f status ALL_PROFILES
+    local pname pid folder_list f status ALL_PROFILES
     local current_groups_json
 
     parse_args "$@"
@@ -810,9 +889,14 @@ main() {
         [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
     fi
 
+    # Set trap before mktemp (M10)
+    trap '[[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"' EXIT INT TERM
     WORK_DIR=$(mktemp -d)
-    trap '[[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"' EXIT
     mkdir -p "$WORK_DIR/cache"
+
+    # Write auth header to file (M9)
+    AUTH_HDR_FILE="$WORK_DIR/auth_header"
+    printf 'Authorization: Bearer %s\n' "$API_TOKEN" > "$AUTH_HDR_FILE"
 
     mkdir -p "$SYNC_CACHE"
     if [[ -f "$SYNC_CACHE/.version" && "$(cat "$SYNC_CACHE/.version")" != "$CACHE_VERSION" ]]; then
@@ -830,7 +914,7 @@ main() {
     log "Pre-downloading HaGeZi folder data..."
 
     for fname in "${!HAGEZI_FOLDERS[@]}"; do
-        cachefile="$WORK_DIR/cache/${fname// /_}.json"
+        cachefile="$WORK_DIR/cache/$(safe_name "$fname").json"
         download_folder_smart "${HAGEZI_FOLDERS[$fname]}" "$cachefile" "$fname"
         dl_status=$?
 
@@ -842,8 +926,7 @@ main() {
             FOLDER_CHANGED["$fname"]=true
             downloaded=$(( downloaded + 1 ))
         else
-            log "  FAILED: $fname"
-            FOLDER_CHANGED["$fname"]=false
+            FOLDER_CHANGED["$fname"]=failed
             failed=$(( failed + 1 ))
         fi
     done
@@ -855,11 +938,12 @@ main() {
         if [[ "$downloaded" -gt 0 ]]; then
             log "UPDATES AVAILABLE: $downloaded folder(s) changed upstream"
             echo "HAGEZI_UPDATES_AVAILABLE=true"
+            exit 0
         else
             log "No updates available"
             echo "HAGEZI_UPDATES_AVAILABLE=false"
+            exit 1
         fi
-        exit 0
     fi
 
     ALL_PROFILES=$(get_all_profiles) || exit
@@ -868,7 +952,13 @@ main() {
         [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]] && continue
 
         pid=$(find_profile_id "$ALL_PROFILES" "$pname")
-        [[ -z "$pid" || "$pid" == "null" ]] && { log ""; log "--- Profile: $pname ---"; log "  ERROR: Profile not found"; continue; }
+        if [[ -z "$pid" || "$pid" == "null" ]]; then
+            log ""
+            log "--- Profile: $pname ---"
+            log "  ERROR: Profile not found"
+            FAILED_COUNT=$(( FAILED_COUNT + 1 ))
+            continue
+        fi
 
         log ""
         log "--- Profile: $pname ($pid) ---"
@@ -877,12 +967,24 @@ main() {
         [[ -z "$folder_list" ]] && { log "  WARN: No folders mapped"; continue; }
 
         # Fetch profile groups ONCE per profile
-        current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to fetch profile groups"; continue; }
+        current_groups_json=$(get_profile_groups "$pid") || {
+            log "  ERROR: Failed to fetch profile groups"
+            FAILED_COUNT=$(( FAILED_COUNT + 1 ))
+            continue
+        }
 
-        IFS=$'\x1F' read -ra TO_SYNC <<< "$folder_list"
+        local IFS=$'\x1F'
+        read -ra TO_SYNC <<< "$folder_list"
         for f in "${TO_SYNC[@]}"; do
-            local cachefile="$WORK_DIR/cache/${f// /_}.json"
+            local cachefile="$WORK_DIR/cache/$(safe_name "$f").json"
             local needs_sync=false
+
+            if [[ "${FOLDER_CHANGED[$f]}" == "failed" ]]; then
+                log "  Folder: $f — download failed previously, skipping"
+                summary_row "$pname" "$f" "❌ Download failed" "-"
+                FAILED_COUNT=$(( FAILED_COUNT + 1 ))
+                continue
+            fi
 
             if [[ "${FOLDER_CHANGED[$f]}" == "false" ]]; then
                 # Cache says unchanged — but validate ControlD still has the rules
@@ -917,9 +1019,14 @@ main() {
                     SUCCESS_COUNT=$(( SUCCESS_COUNT + 1 ))
                 else
                     FAILED_COUNT=$(( FAILED_COUNT + 1 ))
+                    FOLDER_FAILED["$f"]=1
                 fi
-                # ALWAYS refresh state — sync_folder may have mutated it even on failure
-                current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to refresh profile groups"; continue; }
+                # Refresh state — sync_folder may have mutated it even on failure
+                current_groups_json=$(get_profile_groups "$pid") || {
+                    log "  ERROR: Failed to refresh profile groups, aborting profile"
+                    FAILED_COUNT=$(( FAILED_COUNT + 1 ))
+                    break
+                }
             fi
         done
     done
@@ -930,6 +1037,22 @@ main() {
     log "========================================"
 
     print_freshness_report
+
+    # Commit persistent cache only for successfully synced folders (H2 fix)
+    if [[ "$CHECK_UPDATES" == false ]]; then
+        for fname in "${!HAGEZI_FOLDERS[@]}"; do
+            local src="$WORK_DIR/cache/$(safe_name "$fname").json"
+            local dst="$SYNC_CACHE/$(safe_name "$fname").json"
+            if [[ "${FOLDER_FAILED[$fname]}" == "1" ]]; then
+                rm -f "$dst"
+                log "  $fname: sync failed, cache invalidated"
+            else
+                if [[ -f "$src" ]]; then
+                    cp "$src" "$dst"
+                fi
+            fi
+        done
+    fi
 
     exit $(( FAILED_COUNT > 0 ))
 }
