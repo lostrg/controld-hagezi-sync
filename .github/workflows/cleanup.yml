@@ -1,0 +1,92 @@
+name: Cleanup workflow runs
+
+on:
+  workflow_run:
+    workflows: ["Check and Sync HaGeZi to ControlD"]
+    types: [completed]
+  schedule:
+    - cron: '19 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      force_delete_all:
+        description: 'Force delete ALL runs (the latest run of each workflow is still kept)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  actions: write
+
+concurrency:
+  group: cleanup-runs
+  cancel-in-progress: false
+
+jobs:
+  delete-logs:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'schedule'
+    steps:
+      - name: Delete logs for the completed run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/logs
+
+  delete-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force_delete_all }}
+          MAX_RUNS: 100
+          MAX_AGE_DAYS: 30
+        run: |
+          cutoff=$(date -u -d "$MAX_AGE_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+
+          mapfile -t runs < <(
+            gh api --paginate "/repos/$REPO/actions/runs?status=completed&per_page=100" \
+              --jq '.workflow_runs[] | "\(.created_at)\t\(.id)\t\(.workflow_id)\t\(.name)"' \
+            | sort -r
+          )
+          echo "Found ${#runs[@]} completed run(s); mode: $EVENT, force: ${FORCE:-false}"
+
+          declare -A seen
+          deleted=0
+          for line in "${runs[@]}"; do
+            IFS=$'\t' read -r created id wf name <<< "$line"
+            seen[$wf]=$(( ${seen[$wf]:-0} + 1 ))
+
+            # the newest run of each workflow always survives
+            if [[ ${seen[$wf]} -eq 1 ]]; then
+              continue
+            fi
+
+            delete=false
+            if [[ "$FORCE" == "true" ]]; then
+              delete=true
+            elif [[ ${seen[$wf]} -gt $MAX_RUNS ]]; then
+              delete=true
+            elif [[ "$EVENT" != "workflow_run" && "$created" < "$cutoff" ]]; then
+              delete=true
+            fi
+
+            if [[ "$delete" == "true" ]]; then
+              if gh api --silent --method DELETE "/repos/$REPO/actions/runs/$id"; then
+                echo "Deleted run $id ($name, $created)"
+                deleted=$(( deleted + 1 ))
+              else
+                echo "::warning::Failed to delete run $id ($name)"
+              fi
+            fi
+          done
+
+          echo "Deleted $deleted run(s)"
