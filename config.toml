@@ -52,8 +52,3 @@ names = ["Home"]
 
 [profile_folders]
 Home   = ["Apple PR Allow", "Badware Hoster", "META Tracker Allow", "Amazon Tracker Block", "Apple Tracker Block", "MS Tracker Block", "ROKU Tracker Block", "TikTok Tracker Block-Agg", "No Safesearch Support", "Referral Allow", "Most Abused TLDs", "Ult Known Issues Allow"]
-
-  "Most Abused TLDs",
-  "Referral Allow",
-  "META Tracker Allow"
-]
